@@ -10,6 +10,7 @@ launch-md:
   docker run --name magicdraw --rm -ti \
     -p '{{plugin-port}}:{{plugin-port}}' \
     -e DISPLAY='{{docker-display}}' \
+    -e HOME='{{host-home}}' \
     -v '{{host-home}}:{{host-home}}' \
     -v '{{host-home}}/.magicdraw:/root/.magicdraw' \
     -v /tmp/.X11-unix:/tmp/.X11-unix \
