@@ -50,7 +50,7 @@ public class HttpBridgeServer {
     private final HttpServer server;
 
     public HttpBridgeServer(int port) throws IOException {
-        server = HttpServer.create(new InetSocketAddress("127.0.0.1", port), 0);
+        server = HttpServer.create(new InetSocketAddress("0.0.0.0", port), 0);
         server.setExecutor(Executors.newFixedThreadPool(4));
         registerHandlers();
     }
