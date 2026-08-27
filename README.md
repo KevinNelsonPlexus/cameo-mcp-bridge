@@ -73,47 +73,89 @@ All write operations are session-wrapped for undo/redo support. Read operations 
 
 ## Prerequisites
 
-- **CATIA Magic / Cameo Systems Modeler** 2024x or newer (any bundle: Systems of Systems Architect, Cyber Systems Engineer, etc.)
-- **Java 17 JDK** available to Gradle
-- **Python 3.10+** with `pip`
-- **Gradle 8.x** (wrapper included)
+- **Docker**, used both to run MagicDraw itself and (by default) to build the Java plugin against the MagicDraw image's own JDK/Gradle toolchain
+- **CATIA Magic / Cameo Systems Modeler** 2024x Docker image (any bundle: Systems of Systems Architect, Cyber Systems Engineer, etc.) -- set `MAGICDRAW_IMAGE` if yours differs from the default baked into `install.sh`
+- **[uv](https://docs.astral.sh/uv/)**, used to install/manage the Python MCP server -- `install.sh` will offer to install it for you if it's missing
+- **GitHub Copilot CLI** (`copilot`), if you want the installer to auto-register the MCP server; otherwise you can register it manually with any MCP-compatible client
+- Optional: a local **Java 17 JDK** -- only needed if you use `INSTALL_MODE=local-build` instead of the default containerized build
 
 ## Installation
 
-### Quick Install
+### Run the installer
 
 ```bash
-git clone https://github.com/ajhcs/cameo-mcp-bridge.git
+git clone https://github.com/KevinNelsonPlexus/cameo-mcp-bridge.git
 cd cameo-mcp-bridge
-
-# Set your Cameo install path (default: D:/DevTools/CatiaMagic)
-export CAMEO_HOME="/path/to/your/CatiaMagic"
-
-# Optional: point the installer/Gradle at a Java 17 JDK explicitly
-export JDK17_HOME="/path/to/jdk-17"
 
 ./install.sh
 ```
 
-The install script:
-1. Builds the Java plugin with Gradle and passes `CAMEO_HOME` through automatically
-2. Deploys it to `$CAMEO_HOME/plugins/com.claude.cameo.bridge/`
-3. Creates or reuses `mcp-server/.venv/` when not already inside a virtualenv
-4. Installs the Python MCP server into that environment
-5. Registers the MCP server with Claude Code when the `claude` CLI is available
+Run this from a shell with Docker access. On a first run, it will interactively
+walk you through launching the MagicDraw container once so `~/.magicdraw`
+contains your license/configuration before it tries to build or deploy anything.
 
-### Manual Install
+### What `install.sh` does
 
-**1. Build the Java plugin:**
+1. **Verifies MagicDraw is set up.** Checks for `~/.magicdraw` and license
+   evidence; if missing, offers to launch the MagicDraw Docker container so you
+   can complete first-run license activation before continuing.
+2. **Builds the Java plugin.** By default (`INSTALL_MODE=container-build`) it
+   builds inside an ephemeral MagicDraw Docker container using the image's own
+   toolchain, so you don't need a local JDK. Set `INSTALL_MODE=local-build` to
+   build with a local Java 17 JDK instead (auto-detected from `JDK17_HOME` /
+   `JAVA17_HOME` / `JAVA_HOME`).
+3. **Deploys the plugin.** Copies the built plugin jar and `plugin.xml` into
+   `~/.magicdraw/2024x/plugins/com.claude.cameo.bridge/` -- a host-persisted
+   directory that survives container restarts.
+4. **Installs the Python MCP server.** Ensures `uv` is available, installs the
+   configured Python version (`uv python install`), then installs `mcp-server`
+   as an editable global tool (`uv tool install --editable ... --force`),
+   producing a `cameo-mcp` executable on your `PATH`.
+5. **Registers with the Copilot CLI.** If `copilot` is on `PATH`, removes any
+   existing `cameo-bridge` MCP registration and re-adds it pointing at
+   `cameo-mcp`. If `copilot` isn't found, it prints the manual registration
+   command instead.
 
+Useful environment variables to override before running `./install.sh`:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `INSTALL_MODE` | `container-build` | `container-build` or `local-build` |
+| `MAGICDRAW_IMAGE` | (MagicDraw image reference baked into `install.sh`) | Docker image to launch/build against |
+| `CAMEO_HOME` | `/MagicDraw/AM_NM_LEG_MagicDraw.AllOS/1/no_install` | Path to the Cameo/MagicDraw install *inside the build environment* |
+| `CAMEO_PLUGIN_HOME` | `~/.magicdraw/2024x` | Host directory the plugin is deployed into |
+| `UV_PYTHON_VERSION` | `3.11` | Python version installed/used for the MCP server |
+| `DOCKER_DISPLAY` | `$DISPLAY` or `:0` | X11 display forwarded into the MagicDraw container |
+| `JDK17_HOME` / `JAVA17_HOME` | unset | Local JDK 17 home; only used with `INSTALL_MODE=local-build` |
+
+### After installing
+
+1. Launch MagicDraw (`just launch-md`, or run the equivalent `docker run` with the same mounts/port-forward `install.sh` uses).
+2. Open a project.
+3. Start a new Copilot CLI session in this directory.
+4. Ask: `Check cameo status`
+
+The Python side performs a capability handshake against the plugin before
+non-status operations. If `cameo_status` or `cameo_get_capabilities` reports
+`compatibility.clientCompatible = false`, the deployed plugin and the
+registered Python server are out of sync -- rerun `./install.sh`.
+
+The Python MCP layer also ships a Phase 2 methodology surface for bounded
+OOSEM workflows. These tools build named artifact recipes, workflow guidance,
+conformance checks, semantic validation, and compact review packets on top of
+the low-level bridge.
+
+### Manual / advanced install
+
+If you'd rather not use `install.sh`:
+
+**1. Build the plugin:**
 ```bash
 cd plugin
-./gradlew assemblePlugin -PcameoHome="/path/to/CatiaMagic" -Pjdk17Home="/path/to/jdk-17"
+./gradlew assemblePlugin -PcameoHome="/path/to/CatiaMagic" [-Pjdk17Home="/path/to/jdk-17"]
 ```
 
-Gradle must run on a Java 17 JDK. You can also set `JDK17_HOME` or `JAVA17_HOME` instead of passing `-Pjdk17Home=...`.
-
-**2. Deploy to Cameo:**
+**2. Deploy it:**
 
 Copy the contents of `plugin/build/plugin-dist/com.claude.cameo.bridge/` to:
 ```
@@ -121,46 +163,25 @@ Copy the contents of `plugin/build/plugin-dist/com.claude.cameo.bridge/` to:
 ```
 
 **3. Install the Python server:**
-
 ```bash
 cd mcp-server
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install -e .
+uv tool install --editable . --force
+# or, with a plain virtualenv instead of uv:
+python3 -m venv .venv && . .venv/bin/activate && python -m pip install -e .
 ```
-
-On Windows shells, use `.venv\\Scripts\\activate` instead.
 
 **4. Register with your MCP client:**
-
-For Claude Code:
 ```bash
-claude mcp add cameo-bridge --scope user -- /absolute/path/to/mcp-server/.venv/bin/python -m cameo_mcp.server
+copilot mcp add cameo-bridge -- cameo-mcp
 ```
+For other MCP clients, configure stdio transport with the `cameo-mcp`
+executable (or `python -m cameo_mcp.server` from the venv interpreter).
 
-On Windows, the interpreter path is typically `.venv\\Scripts\\python.exe`.
-
-For other MCP clients, configure stdio transport with the venv interpreter and command `-m cameo_mcp.server`.
-
-**5. Restart CATIA Magic**, open a project, and verify:
-
-```
-> Check cameo status
-```
+**5. Restart CATIA Magic**, open a project, and verify with `Check cameo status`.
 
 If a newly added MCP tool returns HTTP 404 after an update, the Python server
 and Java plugin are out of sync. Rebuild/redeploy the plugin, then restart
 CATIA Magic so the new HTTP handlers are loaded.
-
-The Python side now performs a capability handshake against the plugin before
-non-status operations. If `cameo_status` or `cameo_get_capabilities` reports
-`compatibility.clientCompatible = false`, stop and redeploy the matching plugin
-before proceeding.
-
-The Python MCP layer also ships a Phase 2 methodology surface for bounded
-OOSEM workflows. These tools build named artifact recipes, workflow guidance,
-conformance checks, semantic validation, and compact review packets on top of
-the low-level bridge.
 
 ## What's New In 2.3.5
 
@@ -548,7 +569,7 @@ The bridge builds models correctly -- elements, relationships, directionality, s
 
 This bridge is designed for **local development use only**.
 
-- The HTTP server binds to `127.0.0.1` (localhost only) -- not accessible from the network
+- The HTTP server binds to `0.0.0.0` so it is reachable through Docker's port-forwarding when MagicDraw runs in a container -- treat the forwarded port as trusted-network-only, since it is reachable from anywhere that can reach the host's port 18740, not just the host itself
 - There is **no authentication** on the HTTP endpoints
 - The `cameo_execute_macro` tool executes **arbitrary Groovy code** inside the Cameo JVM with full access to the filesystem, network, and classloader
 - CORS headers are set to `*` (wildcard) -- any webpage in a local browser could theoretically make requests to the bridge
