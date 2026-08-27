@@ -13,7 +13,7 @@ authors = [
 ]
 keywords = ["mcp", "cameo", "catia-magic", "sysml", "uml", "mbse"]
 dependencies = [
-    "mcp>=1.0.0",
+    "mcp>=1.0.0,<2.0.0",
     "httpx>=0.25.0",
     "Pillow>=10.0.0",
     "python-pptx>=1.0.2",
