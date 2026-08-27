@@ -2,6 +2,7 @@ package com.claude.cameo.bridge;
 
 import com.nomagic.magicdraw.plugins.Plugin;
 import com.nomagic.magicdraw.core.Application;
+import com.claude.cameo.bridge.util.BridgeSecurityException;
 import java.util.logging.Logger;
 
 public class CameoMCPBridgePlugin extends Plugin {
@@ -15,9 +16,15 @@ public class CameoMCPBridgePlugin extends Plugin {
         try {
             server = new HttpBridgeServer(port);
             server.start();
-            Application.getInstance().getGUILog().log(
-                "CameoMCPBridge: HTTP server started on port " + port);
-            LOG.info("CameoMCPBridge: HTTP server started on port " + port);
+            String message = "CameoMCPBridge: HTTP server started on port " + port
+                + (server.isSecure() ? " (TLS + bearer-token auth enabled)" : " (INSECURE: plaintext mode explicitly authorized)");
+            Application.getInstance().getGUILog().log(message);
+            LOG.info(message);
+        } catch (BridgeSecurityException e) {
+            // Fail closed: never fall back to an unauthenticated bridge.
+            String message = "CameoMCPBridge: refusing to start -- " + e.getMessage();
+            LOG.severe(message);
+            Application.getInstance().getGUILog().showError(message);
         } catch (Exception e) {
             LOG.severe("CameoMCPBridge: Failed to start HTTP server: " + e.getMessage());
             Application.getInstance().getGUILog().showError(

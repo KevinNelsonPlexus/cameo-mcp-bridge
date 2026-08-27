@@ -1,4 +1,6 @@
 import base64
+import os
+import tempfile
 import unittest
 from io import BytesIO
 from typing import Any
@@ -21,6 +23,81 @@ def _make_base64_png(width: int = 20, height: int = 10) -> str:
     buffer = BytesIO()
     image.save(buffer, format="PNG")
     return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+class BridgeSecurityConfigTests(unittest.TestCase):
+    """The client must never connect without the install-time shared secret
+    unless plaintext mode was explicitly authorized via install.sh --allow-insecure.
+    """
+
+    SECURITY_ENV = (
+        "CAMEO_BRIDGE_TOKEN",
+        "CAMEO_BRIDGE_CA_CERT",
+        "CAMEO_BRIDGE_ALLOW_INSECURE",
+    )
+
+    def setUp(self) -> None:
+        reset_client_state()
+        self._patcher = patch.dict(os.environ, {}, clear=False)
+        self._patcher.start()
+        for name in self.SECURITY_ENV:
+            os.environ.pop(name, None)
+
+    def tearDown(self) -> None:
+        self._patcher.stop()
+        reset_client_state()
+
+    def _write_cert(self) -> str:
+        tmp = tempfile.NamedTemporaryFile(suffix=".crt", delete=False)
+        tmp.write(b"-----BEGIN CERTIFICATE-----\n")
+        tmp.close()
+        self.addCleanup(os.unlink, tmp.name)
+        return tmp.name
+
+    def test_refuses_without_any_credentials(self) -> None:
+        with self.assertRaises(RuntimeError) as ctx:
+            client._require_secure_config()
+        self.assertIn("CAMEO_BRIDGE_TOKEN", str(ctx.exception))
+        self.assertIn("CAMEO_BRIDGE_CA_CERT", str(ctx.exception))
+
+    def test_refuses_with_token_but_no_certificate(self) -> None:
+        os.environ["CAMEO_BRIDGE_TOKEN"] = "secret"
+        with self.assertRaises(RuntimeError):
+            client._require_secure_config()
+
+    def test_refuses_with_certificate_but_no_token(self) -> None:
+        os.environ["CAMEO_BRIDGE_CA_CERT"] = self._write_cert()
+        with self.assertRaises(RuntimeError):
+            client._require_secure_config()
+
+    def test_refuses_when_certificate_file_is_missing(self) -> None:
+        os.environ["CAMEO_BRIDGE_TOKEN"] = "secret"
+        os.environ["CAMEO_BRIDGE_CA_CERT"] = "/nonexistent/server.crt"
+        with self.assertRaises(RuntimeError) as ctx:
+            client._require_secure_config()
+        self.assertIn("certificate not found", str(ctx.exception))
+
+    def test_allows_when_fully_provisioned(self) -> None:
+        os.environ["CAMEO_BRIDGE_TOKEN"] = "secret"
+        os.environ["CAMEO_BRIDGE_CA_CERT"] = self._write_cert()
+        client._require_secure_config()
+        self.assertTrue(client._base_url().startswith("https://"))
+
+    def test_allows_when_insecure_explicitly_authorized(self) -> None:
+        os.environ["CAMEO_BRIDGE_ALLOW_INSECURE"] = "true"
+        client._require_secure_config()
+        self.assertTrue(client._base_url().startswith("http://"))
+
+    def test_insecure_flag_must_be_truthy(self) -> None:
+        for value in ("false", "0", "", "no"):
+            with self.subTest(value=value):
+                os.environ["CAMEO_BRIDGE_ALLOW_INSECURE"] = value
+                with self.assertRaises(RuntimeError):
+                    client._require_secure_config()
+
+    def test_get_client_enforces_secure_configuration(self) -> None:
+        with self.assertRaises(RuntimeError):
+            client._get_client()
 
 
 class BridgeMetadataTests(unittest.TestCase):
@@ -1462,7 +1539,9 @@ class ClientRequestTests(unittest.IsolatedAsyncioTestCase):
                 }
                 return _ProbeResponse(200, payload)
 
-        with patch("cameo_mcp.client.httpx.AsyncClient", _ProbeClient):
+        with patch("cameo_mcp.client.httpx.AsyncClient", _ProbeClient), patch.dict(
+            os.environ, {"CAMEO_BRIDGE_ALLOW_INSECURE": "true"}, clear=False
+        ):
             result = await client.probe_bridge()
 
         self.assertTrue(result["reachable"])

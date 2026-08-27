@@ -28,10 +28,16 @@ import com.claude.cameo.bridge.handlers.UiStateHandler;
 import com.claude.cameo.bridge.handlers.ValidationHandler;
 import com.claude.cameo.bridge.handlers.VariantHandler;
 import com.claude.cameo.bridge.util.BridgeCapabilities;
+import com.claude.cameo.bridge.util.BridgeSecurity;
 import com.nomagic.magicdraw.core.Application;
 import com.nomagic.magicdraw.core.Project;
 import com.nomagic.magicdraw.openapi.uml.SessionManager;
+import com.sun.net.httpserver.Filter;
+import com.sun.net.httpserver.HttpContext;
+import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpServer;
+import com.sun.net.httpserver.HttpsConfigurator;
+import com.sun.net.httpserver.HttpsServer;
 import com.sun.net.httpserver.HttpExchange;
 import com.google.gson.JsonObject;
 import javax.swing.SwingUtilities;
@@ -48,30 +54,72 @@ public class HttpBridgeServer {
 
     private static final Logger LOG = Logger.getLogger(HttpBridgeServer.class.getName());
     private final HttpServer server;
+    private final BridgeSecurity security;
+    private final Filter authFilter;
 
     public HttpBridgeServer(int port) throws IOException {
-        server = HttpServer.create(new InetSocketAddress("0.0.0.0", port), 0);
+        security = BridgeSecurity.load();
+
+        if (security.isSecure()) {
+            HttpsServer httpsServer = HttpsServer.create(new InetSocketAddress("0.0.0.0", port), 0);
+            httpsServer.setHttpsConfigurator(new HttpsConfigurator(security.sslContext()));
+            server = httpsServer;
+            LOG.info("CameoMCPBridge: TLS + bearer-token authentication enabled");
+        } else {
+            server = HttpServer.create(new InetSocketAddress("0.0.0.0", port), 0);
+        }
+
+        authFilter = new Filter() {
+            @Override
+            public String description() {
+                return "CameoMCPBridge bearer-token authentication";
+            }
+
+            @Override
+            public void doFilter(HttpExchange exchange, Chain chain) throws IOException {
+                if (!security.isSecure() || "OPTIONS".equals(exchange.getRequestMethod())) {
+                    chain.doFilter(exchange);
+                    return;
+                }
+                String header = exchange.getRequestHeaders().getFirst("Authorization");
+                if (!security.isValidAuthorizationHeader(header)) {
+                    sendError(exchange, 401, "UNAUTHORIZED",
+                            "Missing or invalid bearer token. Re-run install.sh, "
+                                    + "or ensure CAMEO_BRIDGE_TOKEN is set for the MCP server.");
+                    return;
+                }
+                chain.doFilter(exchange);
+            }
+        };
+
         server.setExecutor(Executors.newFixedThreadPool(4));
         registerHandlers();
     }
 
+    /** Creates a context and attaches the bearer-token auth filter to it. */
+    private HttpContext secureContext(String path, HttpHandler handler) {
+        HttpContext context = server.createContext(path, handler);
+        context.getFilters().add(authFilter);
+        return context;
+    }
+
     private void registerHandlers() {
-        server.createContext("/status", this::handleStatus);
-        server.createContext("/capabilities", this::handleCapabilities);
-        server.createContext("/api/v1/status", this::handleStatus);
-        server.createContext("/api/v1/capabilities", this::handleCapabilities);
-        server.createContext("/api/v1/project", new ProjectHandler());
-        server.createContext("/api/v1/ui", new UiStateHandler());
-        server.createContext("/api/v1/inspect/diagrams", new PropertyDumpHandler());
-        server.createContext("/api/v1/containment-tree", new ContainmentTreeHandler());
-        server.createContext("/api/v1/containment-tree/children", new ContainmentTreeHandler());
+        secureContext("/status", this::handleStatus);
+        secureContext("/capabilities", this::handleCapabilities);
+        secureContext("/api/v1/status", this::handleStatus);
+        secureContext("/api/v1/capabilities", this::handleCapabilities);
+        secureContext("/api/v1/project", new ProjectHandler());
+        secureContext("/api/v1/ui", new UiStateHandler());
+        secureContext("/api/v1/inspect/diagrams", new PropertyDumpHandler());
+        secureContext("/api/v1/containment-tree", new ContainmentTreeHandler());
+        secureContext("/api/v1/containment-tree/children", new ContainmentTreeHandler());
 
         // Route /elements by HTTP method and sub-path
         ElementQueryHandler queryHandler = new ElementQueryHandler();
         ElementMutationHandler mutationHandler = new ElementMutationHandler();
         SpecificationHandler specificationHandler = new SpecificationHandler();
-        server.createContext("/api/v1/elements/interface-flow-properties", queryHandler);
-        server.createContext("/api/v1/elements", exchange -> {
+        secureContext("/api/v1/elements/interface-flow-properties", queryHandler);
+        secureContext("/api/v1/elements", exchange -> {
             String path = exchange.getRequestURI().getPath();
             // Route /specification sub-paths to SpecificationHandler (GET and PUT)
             if (path.contains("/specification")) {
@@ -83,32 +131,36 @@ public class HttpBridgeServer {
             }
         });
 
-        server.createContext("/api/v1/relationships", new RelationshipHandler());
-        server.createContext("/api/v1/diagrams", new DiagramHandler());
-        server.createContext("/api/v1/relation-maps", new RelationMapHandler());
-        server.createContext("/api/v1/snapshots", new SnapshotHandler());
-        server.createContext("/api/v1/probes", new ScriptProbeHandler());
-        server.createContext("/api/v1/validation", new ValidationHandler());
-        server.createContext("/api/v1/matrices", new MatrixHandler());
-        server.createContext("/api/v1/generic-tables", new GenericTableHandler());
+        secureContext("/api/v1/relationships", new RelationshipHandler());
+        secureContext("/api/v1/diagrams", new DiagramHandler());
+        secureContext("/api/v1/relation-maps", new RelationMapHandler());
+        secureContext("/api/v1/snapshots", new SnapshotHandler());
+        secureContext("/api/v1/probes", new ScriptProbeHandler());
+        secureContext("/api/v1/validation", new ValidationHandler());
+        secureContext("/api/v1/matrices", new MatrixHandler());
+        secureContext("/api/v1/generic-tables", new GenericTableHandler());
         AdvancedCapabilityHandler advancedCapabilityHandler = new AdvancedCapabilityHandler();
-        server.createContext("/api/v1/reports", new ReportWizardHandler());
-        server.createContext("/api/v1/import-export", new ImportExportHandler());
-        server.createContext("/api/v1/criteria", new CriteriaHandler());
-        server.createContext("/api/v1/profiles", new ProfileHandler());
-        server.createContext("/api/v1/typed-diagrams", new TypedDiagramHandler());
-        server.createContext("/api/v1/requirements", advancedCapabilityHandler);
-        server.createContext("/api/v1/simulation", new SimulationHandler());
-        server.createContext("/api/v1/teamwork", new TeamworkHandler());
-        server.createContext("/api/v1/datahub", new DataHubHandler());
-        server.createContext("/api/v1/variants", new VariantHandler());
-        server.createContext("/api/v1/extensions", new ExtensionProbeHandler());
-        server.createContext("/api/v1/macros", new MacroHandler());
-        server.createContext("/api/v1/session/reset", this::handleSessionReset);
+        secureContext("/api/v1/reports", new ReportWizardHandler());
+        secureContext("/api/v1/import-export", new ImportExportHandler());
+        secureContext("/api/v1/criteria", new CriteriaHandler());
+        secureContext("/api/v1/profiles", new ProfileHandler());
+        secureContext("/api/v1/typed-diagrams", new TypedDiagramHandler());
+        secureContext("/api/v1/requirements", advancedCapabilityHandler);
+        secureContext("/api/v1/simulation", new SimulationHandler());
+        secureContext("/api/v1/teamwork", new TeamworkHandler());
+        secureContext("/api/v1/datahub", new DataHubHandler());
+        secureContext("/api/v1/variants", new VariantHandler());
+        secureContext("/api/v1/extensions", new ExtensionProbeHandler());
+        secureContext("/api/v1/macros", new MacroHandler());
+        secureContext("/api/v1/session/reset", this::handleSessionReset);
     }
 
     public void start() {
         server.start();
+    }
+
+    public boolean isSecure() {
+        return security.isSecure();
     }
 
     public void stop() {

@@ -1,6 +1,11 @@
 #!/bin/bash
 # install.sh - Install the Cameo MCP Bridge
 #
+# Usage:
+#   ./install.sh                    Secure install (default): TLS + shared-secret auth.
+#   ./install.sh --allow-insecure   Explicitly authorize INSECURE plaintext mode (dev only).
+#   ./install.sh --help             Show usage.
+#
 # What this installer does:
 # - Ensures MagicDraw has been launched at least once so host settings/license state exist in ~/.magicdraw.
 # - Builds the Java plugin (default: inside the MagicDraw Docker image; optional: local Java 17 build).
@@ -17,8 +22,16 @@
 # - Prompt-driven preflight: verify/guide first MagicDraw launch + automatic license-evidence check.
 # - Plugin build: INSTALL_MODE=container-build (default) or INSTALL_MODE=local-build.
 # - Plugin deploy: copy built plugin payload into host ~/.magicdraw/2024x plugin directory.
+# - Security provisioning: generate a random secret + self-signed TLS keystore under
+#   ~/.cameo-mcp-bridge. The Java plugin reads the keystore/secret directly from that
+#   directory to serve HTTPS and enforce bearer-token auth. The Python MCP server never
+#   reads that file -- it instead receives the same secret (as a bearer token) and the
+#   server's public certificate (for TLS trust) via its own Copilot MCP registration env vars.
+#   Security is fail-closed: without --allow-insecure, both the plugin and the MCP server
+#   refuse to run at all if the shared secret / TLS material is missing or unusable.
 # - Python setup: ensure uv exists, install/select Python, install cameo-mcp globally via uv tool.
-# - Copilot registration: remove existing 'cameo-bridge' registration (if any), then register fresh.
+# - Copilot registration: remove existing 'cameo-bridge' registration (if any), then register fresh
+#   with CAMEO_BRIDGE_TOKEN / CAMEO_BRIDGE_CA_CERT env vars.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -30,6 +43,48 @@ CAMEO_HOME="${CAMEO_HOME:-/MagicDraw/AM_NM_LEG_MagicDraw.AllOS/1/no_install}"
 MAGICDRAW_SETTINGS_HOME="${HOME}/.magicdraw"
 CAMEO_PLUGIN_HOME="${CAMEO_PLUGIN_HOME:-${MAGICDRAW_SETTINGS_HOME}/2024x}"
 UV_PYTHON_VERSION="${UV_PYTHON_VERSION:-3.11}"
+CAMEO_BRIDGE_HOME="${CAMEO_BRIDGE_HOME:-${HOME}/.cameo-mcp-bridge}"
+# TLS + bearer-token auth are enabled by default and are fail-closed: if the
+# shared secret cannot be established, neither the plugin nor the MCP server
+# will run. Pass --allow-insecure to explicitly authorize the plaintext,
+# unauthenticated fallback (NOT recommended; local development only).
+CAMEO_BRIDGE_ENABLE_TLS="${CAMEO_BRIDGE_ENABLE_TLS:-true}"
+
+usage() {
+    cat <<'EOF'
+Usage: ./install.sh [OPTIONS]
+
+Options:
+  --allow-insecure   Explicitly authorize INSECURE plaintext mode. The bridge will
+                     run without TLS and without shared-secret authentication, so
+                     ANY local client can drive the open MagicDraw project.
+                     Development only.
+  -h, --help         Show this help and exit.
+
+By default the installer provisions a random shared secret and a self-signed TLS
+certificate. Only the plugin and MCP server provisioned by the same install run can
+talk to each other, and both fail closed if that secret is missing or unusable.
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --allow-insecure)
+            CAMEO_BRIDGE_ENABLE_TLS="false"
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Error: unknown option '$1'"
+            echo ""
+            usage
+            exit 1
+            ;;
+    esac
+done
 
 find_java17_home() {
     # Find a usable local Java 17 home for local Gradle builds.
@@ -50,6 +105,91 @@ require_command() {
         echo "Error: required command '$cmd' was not found on PATH."
         exit 1
     fi
+}
+
+provision_bridge_security() {
+    # Generate a random secret and a self-signed TLS keypair for the bridge.
+    #
+    # The Java plugin loads the keystore + secret directly from
+    # CAMEO_BRIDGE_HOME at startup, serves HTTPS with it, and requires the
+    # secret as a bearer token on every request. The Python MCP server never
+    # reads this directory -- it is instead handed the same secret and the
+    # public certificate through its own Copilot MCP registration env vars
+    # (CAMEO_BRIDGE_TOKEN / CAMEO_BRIDGE_CA_CERT), so client and server never
+    # share a single file at runtime.
+    require_command openssl
+
+    echo "Provisioning bridge TLS certificate and auth secret..."
+    mkdir -p "$CAMEO_BRIDGE_HOME"
+    chmod 700 "$CAMEO_BRIDGE_HOME"
+
+    # Clear any marker left by a previous --allow-insecure install so this run
+    # cannot be silently downgraded to plaintext.
+    rm -f "$CAMEO_BRIDGE_HOME/allow-insecure"
+
+    BRIDGE_TOKEN="$(openssl rand -hex 32)"
+
+    local san_config key_path cert_path p12_path token_path
+    san_config="$(mktemp)"
+    key_path="$(mktemp)"
+    cert_path="$CAMEO_BRIDGE_HOME/server.crt"
+    p12_path="$CAMEO_BRIDGE_HOME/server.p12"
+    token_path="$CAMEO_BRIDGE_HOME/token"
+
+    cat > "$san_config" <<'EOF'
+[req]
+distinguished_name = req_distinguished_name
+x509_extensions = v3_req
+prompt = no
+
+[req_distinguished_name]
+CN = cameo-mcp-bridge-local
+
+[v3_req]
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = localhost
+IP.1 = 127.0.0.1
+EOF
+
+    openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \
+        -keyout "$key_path" -out "$cert_path" \
+        -config "$san_config" -extensions v3_req >/dev/null 2>&1
+
+    openssl pkcs12 -export \
+        -inkey "$key_path" -in "$cert_path" \
+        -name cameo-mcp-bridge -out "$p12_path" \
+        -passout "pass:${BRIDGE_TOKEN}" >/dev/null 2>&1
+
+    rm -f "$san_config" "$key_path"
+    chmod 600 "$p12_path"
+
+    printf '%s' "$BRIDGE_TOKEN" > "$token_path"
+    chmod 600 "$token_path"
+    chmod 644 "$cert_path"
+
+    BRIDGE_CA_CERT="$cert_path"
+    echo "Bridge secret + TLS keystore written to: $CAMEO_BRIDGE_HOME"
+    echo ""
+}
+
+provision_insecure_mode() {
+    # Record an explicit, on-disk authorization for plaintext mode.
+    #
+    # The plugin only ever runs unauthenticated when this marker (or an
+    # equivalent env/system-property override) is present. Stale secret/TLS
+    # material is removed so the previous secure pairing cannot linger and so
+    # the two sides cannot disagree about which mode is in effect.
+    echo "Recording explicit authorization for INSECURE plaintext mode..."
+    mkdir -p "$CAMEO_BRIDGE_HOME"
+    chmod 700 "$CAMEO_BRIDGE_HOME"
+    rm -f "$CAMEO_BRIDGE_HOME/token" "$CAMEO_BRIDGE_HOME/server.p12" "$CAMEO_BRIDGE_HOME/server.crt"
+    printf '%s\n' "Created by install.sh --allow-insecure. Delete this file and re-run install.sh to restore TLS + shared-secret auth." \
+        > "$CAMEO_BRIDGE_HOME/allow-insecure"
+    chmod 600 "$CAMEO_BRIDGE_HOME/allow-insecure"
+    echo "Insecure-mode marker written to: $CAMEO_BRIDGE_HOME/allow-insecure"
+    echo ""
 }
 
 prompt_yes_no() {
@@ -135,6 +275,7 @@ launch_magicdraw_container() {
     echo "Launching MagicDraw container..."
     docker run --name magicdraw --rm -ti \
         -e DISPLAY="${DOCKER_DISPLAY}" \
+        -e HOME="${HOST_HOME}" \
         -v "${HOST_HOME}:${HOST_HOME}" \
         -v "${HOST_HOME}/.magicdraw:/root/.magicdraw" \
         -v /tmp/.X11-unix:/tmp/.X11-unix \
@@ -229,9 +370,26 @@ echo "CAMEO_PLUGIN_HOME: $CAMEO_PLUGIN_HOME"
 echo "INSTALL_MODE: $INSTALL_MODE"
 echo "MAGICDRAW_IMAGE: $MAGICDRAW_IMAGE"
 echo "UV_PYTHON_VERSION: $UV_PYTHON_VERSION"
+echo "CAMEO_BRIDGE_ENABLE_TLS: $CAMEO_BRIDGE_ENABLE_TLS"
 echo ""
 
 ensure_magicdraw_profile_dir
+
+# Generate the random secret + self-signed TLS keystore used to secure the
+# bridge (BRIDGE_TOKEN / BRIDGE_CA_CERT are set as side effects for later use).
+# This is the default; set CAMEO_BRIDGE_ENABLE_TLS=false to opt out (dev only).
+BRIDGE_TOKEN=""
+BRIDGE_CA_CERT=""
+if [ "$CAMEO_BRIDGE_ENABLE_TLS" = "true" ]; then
+    provision_bridge_security
+else
+    echo "WARNING: --allow-insecure specified -- skipping TLS/auth provisioning."
+    echo "The bridge will run in INSECURE plaintext mode with NO authentication,"
+    echo "so any local client will be able to drive the open MagicDraw project."
+    echo "This is not recommended outside local development."
+    echo ""
+    provision_insecure_mode
+fi
 
 # Build the Java plugin
 echo "Building Java plugin..."
@@ -295,10 +453,25 @@ if command -v copilot >/dev/null 2>&1; then
         echo "Existing Copilot MCP registration found for 'cameo-bridge'; removing it..."
         copilot mcp remove cameo-bridge
     fi
-    copilot mcp add cameo-bridge -- cameo-mcp
+    if [ -n "$BRIDGE_TOKEN" ]; then
+        copilot mcp add cameo-bridge \
+            --env "CAMEO_BRIDGE_TOKEN=${BRIDGE_TOKEN}" \
+            --env "CAMEO_BRIDGE_CA_CERT=${BRIDGE_CA_CERT}" \
+            -- cameo-mcp
+    else
+        copilot mcp add cameo-bridge \
+            --env "CAMEO_BRIDGE_ALLOW_INSECURE=true" \
+            -- cameo-mcp
+    fi
 else
     echo "Copilot CLI not found. Register manually with:"
-    echo "  copilot mcp add cameo-bridge -- cameo-mcp"
+    if [ -n "$BRIDGE_TOKEN" ]; then
+        echo "  copilot mcp add cameo-bridge --env CAMEO_BRIDGE_TOKEN=<token> --env CAMEO_BRIDGE_CA_CERT=<cert-path> -- cameo-mcp"
+        echo "  (token: ${BRIDGE_TOKEN})"
+        echo "  (cert:  ${BRIDGE_CA_CERT})"
+    else
+        echo "  copilot mcp add cameo-bridge --env CAMEO_BRIDGE_ALLOW_INSECURE=true -- cameo-mcp"
+    fi
 fi
 echo ""
 echo "=== Installation complete ==="
